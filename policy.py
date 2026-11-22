@@ -1,0 +1,67 @@
+"""Deterministic Step 1 policy for the Mech Royale game."""
+
+import math
+
+import mechfight as mf
+
+
+def navigate(obs: mf.Observation) -> tuple[list[float], bool]:
+    """Return world-frame movement and grounded emergency boost."""
+    me = obs["self"]
+    x, y, _ = me["pos"]
+    goal_x, goal_y = obs["zone"]["next_center"]
+    dx, dy = goal_x - x, goal_y - y
+    scale = max(1.0, math.hypot(dx, dy))
+    boost = not me["in_zone"] and me["grounded"] and me["energy"] > 0
+    return [dx / scale, dy / scale], boost
+
+
+def select_target(obs: mf.Observation) -> mf.ActorObs | None:
+    """Select the closest tracked opposing mech, breaking ties by id."""
+    origin = obs["self"]["pos"]
+    return min(
+        (actor for actor in obs["mechs"] if actor["kind"] == "mech"),
+        key=lambda actor: (math.dist(origin, actor["pos"]), actor["id"]),
+        default=None,
+    )
+
+
+def gun_controls(
+    obs: mf.Observation, target: mf.ActorObs | None, config: mf.Config
+) -> tuple[list[float] | None, list[bool], bool]:
+    """Return aim, two slot triggers, and the gun reload request."""
+    me = obs["self"]
+    gun = me["weapons"][0]
+    fire = [False, False]
+    if gun is None or gun["kind"] != "gun":
+        return None, fire, False
+
+    reload = gun.get("ammo") == 0 and gun.get("reload", 0) == 0
+    if target is None:
+        return None, fire, reload
+
+    x, y, z = me["pos"]
+    tx, ty, tz = target["pos"]
+    dx, dy = tx - x, ty - y
+    # Observed positions are at the feet. Aim at the base mech center.
+    dz = tz + config["mech"]["height"] / 2 - (z + me["stats"]["muzzle_height"])
+    horizontal = math.hypot(dx, dy)
+    yaw = math.atan2(dy, dx)
+    pitch = math.atan2(dz, horizontal)
+    actual_yaw, actual_pitch = me["aim"]
+    yaw_error = math.remainder(yaw - actual_yaw, math.tau)
+    aim_error = math.hypot(yaw_error * math.cos(pitch), pitch - actual_pitch)
+    distance = math.hypot(horizontal, dz)
+    fire[0] = (
+        distance <= gun["stats"]["range"]
+        and aim_error <= math.atan2(config["mech"]["radius"], distance)
+        and gun.get("ammo", 0) > 0
+        and gun.get("reload", 0) == 0
+    )
+    return [yaw, pitch], fire, reload
+
+
+def resources(obs: mf.Observation) -> int | None:
+    """Return an upgrade choice index when an offer has choices."""
+    offer = obs["offer"]
+    return 0 if offer and offer["choices"] else None
