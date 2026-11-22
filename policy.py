@@ -10,9 +10,28 @@ def navigate(obs: mf.Observation) -> tuple[list[float], bool]:
     me = obs["self"]
     x, y, _ = me["pos"]
     goal_x, goal_y = obs["zone"]["next_center"]
+    target = select_target(obs)
+    fleeing = False
+    if me["in_zone"] and target is not None:
+        away_x = x - target["pos"][0]
+        away_y = y - target["pos"][1]
+        distance = math.hypot(away_x, away_y)
+        if distance < 90:
+            # Project an escape waypoint onto the interior of the next circle.
+            # A sideways component keeps the bot moving at the circle boundary.
+            side = 1 if me["id"] % 2 == 0 else -1
+            if distance < 0.01:
+                away_x, away_y, distance = 1.0, 0.0, 1.0
+            offset_x = x + 35 * (away_x - side * 0.8 * away_y) / distance - goal_x
+            offset_y = y + 35 * (away_y + side * 0.8 * away_x) / distance - goal_y
+            radius = max(0.0, obs["zone"]["next_radius"] - 5.0)
+            ratio = min(1.0, radius / max(0.01, math.hypot(offset_x, offset_y)))
+            goal_x += ratio * offset_x
+            goal_y += ratio * offset_y
+            fleeing = distance < 55 and me["energy"] > 0.4 * me["max_energy"]
     dx, dy = goal_x - x, goal_y - y
     scale = max(1.0, math.hypot(dx, dy))
-    boost = not me["in_zone"] and me["grounded"] and me["energy"] > 0
+    boost = (fleeing or not me["in_zone"]) and me["grounded"] and me["energy"] > 0
     return [dx / scale, dy / scale], boost
 
 
