@@ -1,5 +1,5 @@
 import mechfight as mf
-from policy import gun_controls, navigate, resources, select_target
+from policy import StallRecovery, gun_controls, navigate, resources, select_target
 
 
 class Aspire:
@@ -7,9 +7,11 @@ class Aspire:
 
     def __init__(self, hello: mf.Hello):
         self.config = hello["config"]
+        self.recovery = StallRecovery()
 
     def act(self, obs: mf.Observation) -> mf.Action:
         move, boost = navigate(obs)
+        move = self.recovery.steer(obs, move)
         target = select_target(obs)
         aim, fire, reload = gun_controls(obs, target, self.config)
         pick = resources(obs)
