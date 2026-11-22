@@ -25,10 +25,10 @@ from typing import Any, Optional
 import mechfight as mf
 
 WEAPON_PRIORITY = {
-    "lightning": 4,
-    "laser": 3,
-    "mortar": 2,
+    "lightning": 3,
+    "laser": 2,
     "gun": 1,
+    "mortar": 0,
 }
 
 NUM_BINS = 16
@@ -101,13 +101,14 @@ def _zone_urgency(obs: mf.Observation) -> tuple[bool, float, float]:
 
 
 class StallRecovery:
-    """Detect stalled ground movement and trigger lateral or reverse escape + jump."""
+    """Detect stalled ground movement and trigger lateral or reverse escape + ledge jump."""
 
     def __init__(self):
         self.anchor = None
         self.sample_time = 0.0
         self.escape_until = 0.0
         self.escape = [0.0, 0.0]
+        self.side = 1
         self.stall_count = 0
 
     def steer(
@@ -122,22 +123,20 @@ class StallRecovery:
             self.stall_count = 0
             return move, False
         if now < self.escape_until:
-            return self.escape.copy(), (self.stall_count >= 2 and me["grounded"] and me["energy"] >= 15.0)
+            return self.escape.copy(), False
         if self.anchor is None:
             self.anchor, self.sample_time = pos, now
-        elif now - self.sample_time >= 0.7:
-            stalled = math.dist(self.anchor, pos) < 0.70
+        elif now - self.sample_time >= 0.75:
+            stalled = math.dist(self.anchor, pos) < 0.75
             self.anchor, self.sample_time = pos, now
             if stalled:
                 self.stall_count += 1
                 if self.stall_count % 3 == 0:
-                    # Reverse completely (cul-de-sac escape)
                     self.escape = _clamp_vec2(-move[0], -move[1])
-                    self.escape_until = now + 1.6
+                    self.escape_until = now + 1.4
                 else:
-                    # Lateral escape (alternate left / right)
-                    side = 1.0 if (self.stall_count % 2 == 1) else -1.0
-                    self.escape = _clamp_vec2(-side * move[1], side * move[0])
+                    self.escape = _clamp_vec2(-self.side * move[1], self.side * move[0])
+                    self.side *= -1
                     self.escape_until = now + 1.1
                 self.anchor = None
                 want_jump = me["grounded"] and me["energy"] >= 20.0
@@ -262,13 +261,12 @@ class AspirePolicy:
         self.last_near_sound_t = -10.0
         self.rear_attacker_id: Optional[int] = None
         self.rear_attacker_t = -10.0
+        self.last_attacker_id: Optional[int] = None
+        self.last_attacker_t = -10.0
+        self.last_target_id: Optional[int] = None
         self._dmg_window: deque[tuple[float, float]] = deque(maxlen=35)
         self._vel_hist: dict[int, tuple[float, float, float]] = {}
         self._upgrade_defs = {u.get("id", ""): u for u in config.get("upgrades", [])}
-        self.lock_target_id: Optional[int] = None
-        self.lock_until: float = 0.0
-        self.last_target_id: Optional[int] = None
-        self.last_target_los_t: float = -10.0
 
     def _update_trackers(self, obs: mf.Observation) -> bool:
         now = obs["t"]
@@ -278,6 +276,9 @@ class AspirePolicy:
                 amt = float(ev.get("amount", 0.0))
                 tick_dmg += amt
                 self.last_damage_t = now
+                if ev.get("by") is not None:
+                    self.last_attacker_id = int(ev["by"])
+                    self.last_attacker_t = now
                 if ev.get("rear") and ev.get("by") is not None:
                     self.rear_attacker_id = int(ev["by"])
                     self.rear_attacker_t = now
@@ -447,33 +448,28 @@ class AspirePolicy:
         muzzle_off = me.get("stats", {}).get("muzzle_height", 7.0)
 
         visible_mechs = [a for a in obs.get("mechs", []) if a.get("kind") == "mech"]
-        now = obs["t"]
-
-        # Sticky target lock for low-HP targets (ensure 100% kill conversion)
-        if self.lock_target_id is not None:
-            locked_actor = next((a for a in visible_mechs if a["id"] == self.lock_target_id), None)
-            if locked_actor is not None and locked_actor.get("hp", 0) > 0 and now < self.lock_until:
-                los_locked = _has_los_3d(self.ground_map, my_pos, locked_actor["pos"], muzzle_off, 4.5)
-                if los_locked:
-                    self.last_target_los_t = now
-                self.last_target_id = int(locked_actor["id"])
-                return locked_actor, "mech"
-            self.lock_target_id = None
-
         best_mech = None
         best_score = -1e9
         nearest_dist = 1e9
-        for actor in visible_mechs:
-            nearest_dist = min(nearest_dist, math.dist(my_pos, actor["pos"]))
+
+        any_los = any(
+            _has_los_3d(self.ground_map, my_pos, a["pos"], muzzle_off, 4.5)
+            for a in visible_mechs
+        )
 
         for actor in visible_mechs:
             dist = math.dist(my_pos, actor["pos"])
+            nearest_dist = min(nearest_dist, dist)
             los = _has_los_3d(self.ground_map, my_pos, actor["pos"], muzzle_off, 4.5)
+            if any_los and not los:
+                continue
+
             hp = max(1.0, actor.get("hp", 1400.0))
             aid = int(actor["id"])
             enemy_w = set(actor.get("weapons") or [])
 
-            dps_eff = 187.5 if dist <= 230.0 else 0.0
+            eff_hit = 1.0 if has_laser else max(0.15, min(1.0, 1.25 - (dist / 115.0)))
+            dps_eff = (187.5 * eff_hit) if dist <= 230.0 else 0.0
             if has_lightning and dist <= 45.0 and me["energy"] >= 6.0:
                 chain_k = sum(
                     1 for other in visible_mechs
@@ -483,50 +479,26 @@ class AspirePolicy:
             if has_laser and dist <= 280.0:
                 dps_eff += 131.25 * (1.6 if "mortar" in enemy_w else 1.0)
 
-            enemy_aim = actor.get("aim", [0.0, 0.0])[0]
-            to_me_ang = math.atan2(my_pos[1] - actor["pos"][1], my_pos[0] - actor["pos"][0])
-            is_rear = abs(math.remainder(to_me_ang - enemy_aim, math.tau)) > (math.pi * 0.45)
-
             kill_bonus = 0.0
-            if dist <= 95.0 or nearest_dist > 65.0:
-                if hp <= 280.0:
-                    kill_bonus += 550.0
-                elif hp <= 550.0:
-                    kill_bonus += 350.0
-                elif hp <= 850.0:
-                    kill_bonus += 200.0
-            if is_rear:
-                kill_bonus += 160.0
-            if los and has_laser and dist <= 280.0 and hp <= (504.0 if ("mortar" in enemy_w or is_rear) else 315.0):
-                kill_bonus += 450.0
-
-            rear_attacker_bonus = 0.0
-            if self.rear_attacker_id == aid and (now - self.rear_attacker_t) <= 2.5:
-                rear_attacker_bonus = 700.0
-
-            # Persistence bonus: do not abandon an enemy we are actively dueling!
-            persistence_bonus = 280.0 if aid == self.last_target_id else 0.0
-
-            # LOS score: graceful degradation if target temporarily ducked behind cover
             if los:
-                los_score = 300.0
-            elif aid == self.last_target_id and (now - self.last_target_los_t) <= 2.0:
-                los_score = 80.0
-            else:
-                los_score = -200.0
-
-            # Distance weighting: prefer close targets, penalize distant distractions
-            dist_score = max(0.0, 160.0 - dist) * 2.5
-            if nearest_dist <= 85.0 and dist > 115.0:
-                dist_score -= 800.0
+                if has_laser and dist <= 280.0 and hp <= (504.0 if "mortar" in enemy_w else 315.0):
+                    kill_bonus += 520.0
+                elif hp <= 380.0 and (dist <= 125.0 or has_laser or nearest_dist > 75.0):
+                    kill_bonus += 360.0 + max(0.0, (380.0 - hp) * 1.6)
+                if has_lightning and "laser" in enemy_w and dist <= 45.0:
+                    kill_bonus += 130.0
+                if (obs["t"] - self.last_attacker_t) <= 1.5 and aid == self.last_attacker_id:
+                    kill_bonus += 220.0
+                if self.rear_attacker_id == aid and (obs["t"] - self.rear_attacker_t) <= 1.2:
+                    kill_bonus += 170.0
+                if aid == self.last_target_id:
+                    kill_bonus += 160.0
 
             score = (
-                los_score
+                (280.0 if los else -160.0)
                 + kill_bonus
-                + rear_attacker_bonus
-                + persistence_bonus
-                + (dps_eff / hp) * 220.0
-                + dist_score
+                + (dps_eff / hp) * 190.0
+                + max(0.0, 220.0 - dist) * 0.85
                 - actor["id"] * 1e-4
             )
             if score > best_score:
@@ -535,16 +507,12 @@ class AspirePolicy:
 
         if best_mech is not None:
             self.last_target_id = int(best_mech["id"])
-            if _has_los_3d(self.ground_map, my_pos, best_mech["pos"], muzzle_off, 4.5):
-                self.last_target_los_t = now
-            if best_mech.get("hp", 9999.0) <= 650.0:
-                self.lock_target_id = int(best_mech["id"])
-                self.lock_until = now + 4.0
             return best_mech, "mech"
+        self.last_target_id = None
 
-        # Early snowball crate farming only when at 100% full health & safe (never break healing)
+        # Early snowball crate farming when healthy & no threat within 75 m
         hp_frac = me["hp"] / max(1.0, me["max_hp"])
-        if me["in_zone"] and nearest_dist > 75.0 and hp_frac >= 0.98 and me.get("cubes", 0) < 10:
+        if me["in_zone"] and nearest_dist > 75.0 and hp_frac >= 0.68 and me.get("cubes", 0) < 10:
             crates = [
                 c for c in obs.get("crates", [])
                 if math.dist(my_pos, c["pos"]) <= 55.0
@@ -607,10 +575,6 @@ class AspirePolicy:
 
         target_z_off = 4.5 if target_kind == "mech" else 1.0
         los = _has_los_3d(self.ground_map, me["pos"], target["pos"], muzzle_off, target_z_off)
-        if not los and (rear_hit or (now - self.rear_attacker_t <= 1.2)):
-            psi = self.belief.best_facing(rear_hit)
-            if psi is not None:
-                return [psi, 0.0], fire, reload
         direct_dist = math.dist(me["pos"], target["pos"])
         eff_r = self.config["mech"]["radius"] * (
             1.0 + 0.05 * target.get("cubes", 0.0) if target_kind == "mech" else 0.75
@@ -635,6 +599,8 @@ class AspirePolicy:
             err_slewed = math.hypot(rem_yaw * math.cos(pitch), rem_pitch)
             return yaw, pitch, dist, min(err_now, err_slewed)
 
+        hold_for_regen = (margin <= 0.0) and (not los) and me["in_zone"]
+
         tx, ty, tz = target["pos"]
         scale = 1.0 + 0.05 * target.get("cubes", 0.0) if target_kind == "mech" else 1.0
         raw_z = tz + (0.5 * self.config["mech"]["height"] * scale if target_kind == "mech" else 1.0)
@@ -650,12 +616,6 @@ class AspirePolicy:
             default=1e9,
         )
         cube_mult = 1.0 + 0.04 * min(10, me.get("cubes", 0))
-
-        # Hold fire to trigger 45 HP/s natural regen when behind cover or unthreatened
-        hold_for_regen = me["in_zone"] and (
-            (margin <= 0.0 and not los)
-            or (me["hp"] < me["max_hp"] * 0.92 and (not los or nearest_enemy > 75.0))
-        )
 
         # 1. Laser: hitscan snipe with exact lethal-release damage calculation
         if "laser" in slots and target_kind == "mech" and not hold_for_regen:
@@ -678,8 +638,8 @@ class AspirePolicy:
                 fire[l_idx] = not release
             elif (
                 los
-                and raw_dist <= l_stats.get("range", 280.0)
-                and (target.get("hp", 9999.0) <= 350.0 or nearest_enemy > 28.0)
+                and 45.0 < raw_dist <= l_stats.get("range", 280.0)
+                and nearest_enemy > 65.0
                 and not imminent_proj
                 and not urgent_zone
                 and laser.get("cooldown", 0.0) <= 0.05
@@ -714,8 +674,8 @@ class AspirePolicy:
             yaw, pitch, dist, aim_err = _aim_angles_slew(px, py, pz)
             if desired_aim is None:
                 desired_aim = [yaw, pitch]
-            gate = max(math.atan2(eff_r * 1.45, max(1.0, dist)), 0.038)
-            aligned = (aim_err <= gate) or (raw_dist <= 75.0 and raw_aim_err <= gate)
+            gate = max(math.atan2(eff_r * 1.2, max(1.0, dist)), 0.028)
+            aligned = (aim_err <= gate) or (raw_dist <= 65.0 and raw_aim_err <= gate)
             if (
                 los
                 and dist <= g_range
@@ -750,12 +710,12 @@ class AspirePolicy:
         best_take, best_drop, best_prio = None, None, 0
         for item in obs.get("pickups", []):
             kind = item.get("kind")
-            if kind not in ("lightning", "laser", "mortar") or kind in held:
+            if kind not in ("lightning", "laser") or kind in held:
                 continue
             ix, iy, iz = item["pos"]
             if math.hypot(ix - mx, iy - my) > reach - 0.1 or abs(iz - mz) > 3.9:
                 continue
-            prio = WEAPON_PRIORITY.get(kind, 0)
+            prio = WEAPON_PRIORITY[kind]
             if empty is not None and prio > best_prio:
                 best_take, best_drop, best_prio = int(item["id"]), None, prio
             elif empty is None and swap_slot is not None and prio > swap_prio and prio > best_prio:
@@ -776,34 +736,24 @@ class AspirePolicy:
             up = self._upgrade_defs.get(uid, {})
             text = f"{uid} {ch.get('name', '')} {ch.get('desc', '')}".lower()
             s = 10.0
-            # S-tier survivability & burst lethality upgrades
-            if uid == "nanites":
-                s += 95.0
-            elif uid == "armor":
-                s += 85.0
-            elif uid == "plating":
-                s += 80.0
-            elif uid == "lightning_efficiency" and "lightning" in held:
-                s += 75.0
-            elif uid == "gun_damage":
-                s += 65.0
-            elif uid == "laser_damage" and "laser" in held:
-                s += 65.0
-            elif uid == "gun_rate":
-                s += 55.0
-
             for eff in up.get("effects", []):
                 p = eff.get("path", "").lower()
                 if "armor" in p or "damage_taken" in p:
-                    s += 45.0
+                    s += 62.0
                 elif "max_hp" in p or "regen" in p:
-                    s += 40.0
+                    s += 54.0 if hp_frac < 0.75 else 44.0
                 elif any(f"weapons.{w}" in p for w in held):
-                    s += 35.0
+                    s += 40.0
                 elif "speed" in p or "energy" in p:
-                    s += 20.0
+                    s += 24.0
                 else:
-                    s += 10.0
+                    s += 14.0
+            if "armor" in text:
+                s += 20.0
+            elif "regen" in text or "hp" in text:
+                s += 16.0
+            elif "rate" in text or "damage" in text:
+                s += 12.0
             return s
 
         return max(range(len(choices)), key=lambda i: (_val(choices[i]), -i))
@@ -819,7 +769,7 @@ class AspirePolicy:
                 continue
             min_clear = min((math.hypot(px - e["pos"][0], py - e["pos"][1]) for e in enemies), default=100.0)
             bfs_gain = dx * z_vec[0] + dy * z_vec[1]
-            sc = min_clear + 14.0 * bfs_gain
+            sc = min_clear + 16.0 * bfs_gain
             if sc > best_score:
                 best_score = sc
                 best_dir = [dx, dy]
@@ -841,7 +791,7 @@ class AspirePolicy:
             self.last_strafe_flip = now
 
         enemies = [a for a in obs.get("mechs", []) if a.get("kind") == "mech"]
-        urgent_zone, dist_to_safe, _ = _zone_urgency(obs)
+        urgent_zone, _, _ = _zone_urgency(obs)
         nx, ny = obs["zone"]["next_center"]
         n_rad = obs["zone"]["next_radius"]
         z_fb = _clamp_vec2(nx - mx, ny - my)
@@ -877,33 +827,28 @@ class AspirePolicy:
                 best_p = None
                 for item in obs.get("pickups", []):
                     kind = item.get("kind")
-                    if kind not in ("lightning", "laser", "mortar") or kind in held:
+                    if kind not in ("lightning", "laser") or kind in held:
+                        continue
+                    if kind == "laser" and nearest_enemy <= 55.0:
+                        continue
+                    if kind == "lightning" and nearest_enemy <= 35.0:
                         continue
                     ix, iy = item["pos"][:2]
                     d_it = math.hypot(ix - mx, iy - my)
-                    if d_it > 72.0 or math.hypot(ix - nx, iy - ny) > n_rad:
-                        continue
-                    if empty is not None and d_it <= 45.0 and nearest_enemy > 20.0:
-                        pass
-                    elif kind == "laser" and nearest_enemy <= 45.0:
-                        continue
-                    elif kind == "lightning" and nearest_enemy <= 30.0:
-                        continue
-                    elif kind == "mortar" and (empty is None or nearest_enemy <= 40.0):
-                        continue
-                    if self.ground_map is None or self.ground_map.has_los(mx, my, ix, iy):
-                        sc = WEAPON_PRIORITY.get(kind, 0) * 30.0 - d_it
-                        if best_p is None or sc > best_p[0]:
-                            best_p = (sc, _unit_vec2(ix - mx, iy - my))
+                    if d_it <= 72.0 and math.hypot(ix - nx, iy - ny) <= n_rad:
+                        if self.ground_map is None or self.ground_map.has_los(mx, my, ix, iy):
+                            sc = WEAPON_PRIORITY[kind] * 30.0 - d_it
+                            if best_p is None or sc > best_p[0]:
+                                best_p = (sc, _unit_vec2(ix - mx, iy - my))
                 if best_p is not None:
                     loot_vec = best_p[1]
 
             my_cubes = me.get("cubes", 0)
-            want_cubes = (my_cubes < 12) or (me["hp"] < me["max_hp"] * 0.50 and my_cubes < 15)
-            if loot_vec is None and want_cubes:
+            want_cubes = my_cubes < 10 or me["hp"] < me["max_hp"] * 0.65 or my_cubes == 14
+            if loot_vec is None and want_cubes and nearest_enemy > 38.0:
                 near_cubes = [
                     c for c in obs.get("cubes", [])
-                    if math.hypot(c["pos"][0] - mx, c["pos"][1] - my) <= (18.0 if nearest_enemy <= 38.0 else 50.0)
+                    if math.hypot(c["pos"][0] - mx, c["pos"][1] - my) <= 50.0
                     and math.hypot(c["pos"][0] - nx, c["pos"][1] - ny) <= n_rad
                     and (self.ground_map is None or self.ground_map.has_los(mx, my, c["pos"][0], c["pos"][1]))
                 ]
@@ -920,10 +865,8 @@ class AspirePolicy:
             target is not None
             and target_kind == "mech"
             and target.get("hp", 9999.0) <= 350.0
-            and me["hp"] > 300.0
-            and los_attackers <= 1
+            and me["hp"] > 280.0
         )
-
         need_cover = (
             not urgent_zone
             and not hold_pos
@@ -931,9 +874,8 @@ class AspirePolicy:
             and not finish_override
             and (
                 (margin <= 0.0)
-                or (los_attackers >= 2 and nearest_enemy <= 125.0)
-                or (me["hp"] < me["max_hp"] * 0.85 and nearest_enemy > 35.0)
-                or (gun_reloading and "lightning" not in held and los_attackers >= 1 and nearest_enemy <= 85.0)
+                or (los_attackers >= 2 and nearest_enemy <= 120.0)
+                or (gun_reloading and "lightning" not in held and los_attackers >= 1)
             )
         )
 
@@ -975,55 +917,27 @@ class AspirePolicy:
                 d1 = max(1e-3, math.hypot(tx - mx, ty - my))
                 u1x, u1y = (tx - mx) / d1, (ty - my) / d1
                 perp_x, perp_y = -u1y * self.strafe_dir, u1x * self.strafe_dir
-                tvx, tvy = target.get("vel", [0.0, 0.0])[:2]
-                is_fleeing = (tvx * u1x + tvy * u1y) > 3.0
-                target_hp = target.get("hp", 1400.0)
-
-                if finish_override:
-                    # Pure direct pursuit sprint to guarantee lethal kill conversion
-                    cand = _unit_vec2(u1x, u1y)
-                elif (is_fleeing or target_hp <= 850.0) and los_attackers <= 1 and me["hp"] > 400.0:
-                    # Relentless pursuit of fleeing / wounded enemy: close into 32-42m kill zone!
-                    gamma = -0.75 if d1 > 38.0 else (0.45 if d1 < 24.0 else 0.0)
-                    cand = _unit_vec2(
-                        perp_x * 0.6 + 0.25 * z_vec[0] - gamma * u1x,
-                        perp_y * 0.6 + 0.25 * z_vec[1] - gamma * u1y,
-                    )
-                elif "lightning" in held and d1 <= 120.0 and los_attackers <= 1 and me["hp"] > 400.0:
-                    # 1v1 Lightning burst melt: close into 28-36m sweet spot for 427.5 DPS melt!
-                    gamma = -0.65 if d1 > 35.0 else (0.50 if d1 < 22.0 else 0.0)
-                    cand = _unit_vec2(
-                        perp_x * 0.7 + 0.25 * z_vec[0] - gamma * u1x,
-                        perp_y * 0.7 + 0.25 * z_vec[1] - gamma * u1y,
-                    )
-                elif "laser" in held and d1 <= 180.0:
-                    # Laser-Gun mid-long kite band (75-105 m)
-                    gamma = max(-0.25, min(1.4, (85.0 - d1) / 22.0))
-                    cand = _unit_vec2(
-                        perp_x + 0.30 * z_vec[0] - gamma * u1x,
-                        perp_y + 0.30 * z_vec[1] - gamma * u1y,
-                    )
+                if finish_override and los_attackers <= 1:
+                    # Relentless close-in lethal pursuit: stay in 25-35m sweet spot
+                    gamma = -0.70 if d1 > 34.0 else (0.50 if d1 < 22.0 else 0.0)
+                elif "lightning" in held and d1 <= 65.0 and me["hp"] > 480.0 and los_attackers <= 1:
+                    # 1v1 Lightning-Gun burst melt: close into 26-36 m sweet spot while strafing
+                    gamma = -0.65 if d1 > 34.0 else (0.55 if d1 < 22.0 else 0.0)
+                elif "laser" in held and "lightning" not in held and d1 <= 150.0:
+                    # Laser-Gun mid-long kite band (75-120 m)
+                    gamma = max(-0.2, min(1.4, (90.0 - d1) / 25.0))
                 else:
-                    # Safe gun kite distance (70-75 m, keeping easy bots outside lead/hit range)
-                    gamma = max(-0.25, min(1.4, (72.0 - d1) / 20.0))
-                    cand = _unit_vec2(
-                        perp_x + 0.30 * z_vec[0] - gamma * u1x,
-                        perp_y + 0.30 * z_vec[1] - gamma * u1y,
-                    )
+                    gamma = max(0.0, min(1.4, (72.0 - d1) / 25.0))
+                cand = _unit_vec2(
+                    perp_x + 0.30 * z_vec[0] - gamma * u1x,
+                    perp_y + 0.30 * z_vec[1] - gamma * u1y,
+                )
             else:
                 cand = move
 
-            if cover_dir is not None:
-                move = cover_dir
-            else:
-                ok = False
-                for step in (2.5, 5.0):
-                    px, py = mx + cand[0] * step, my + cand[1] * step
-                    if self.ground_map is None or self.ground_map.is_walkable_point(px, py):
-                        ok = True
-                        break
-                if ok:
-                    move = cand
+            probe_x, probe_y = mx + cand[0] * 6.0, my + cand[1] * 6.0
+            if self.ground_map is None or self.ground_map.is_walkable_point(probe_x, probe_y):
+                move = cand
 
         # 3. 3D Ballistic Projectile / Mortar / Laser Dodge blend
         dodge = None if hold_pos else self._dodge_vector_3d(obs)
@@ -1044,7 +958,6 @@ class AspirePolicy:
             or dodge is not None
             or nearest_enemy < 58.0
             or closing_pursuers >= 2
-            or finish_override
         )
         if not me["grounded"] or _is_laser_charging(me) or math.hypot(move[0], move[1]) < 0.3:
             self.boost_active = False

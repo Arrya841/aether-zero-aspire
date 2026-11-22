@@ -19,6 +19,8 @@ class GroundMap:
         self.solid_top: dict[tuple[int, int], float] = {}
         self.solid: set[tuple[int, int]] = set()
         for prism in world.get("prisms", []):
+            if prism.get("kind") == "bridge" and prism.get("top", 0.0) <= 2.0:
+                continue
             top_z = float(prism.get("top", 25.0))
             cells = self.fill(prism["ring"])
             for hole in prism.get("holes", []):
