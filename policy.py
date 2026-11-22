@@ -1,8 +1,24 @@
-"""Deterministic Step 1 policy for the Mech Royale game."""
+"""Deterministic Step 1 policy contracts and ASPIRE v4 policy exports."""
+from __future__ import annotations
 
 import math
+from typing import Any, Optional
 
 import mechfight as mf
+
+# Re-export v4 policy components
+from combat_policy import (
+    AspirePolicy,
+    AngularThreatBelief,
+    StallRecovery as V4StallRecovery,
+    _clamp_vec2,
+    _unit_vec2,
+    _has_los_3d,
+    WEAPON_PRIORITY,
+    NUM_BINS,
+    BIN_WIDTH,
+    BIN_CENTERS,
+)
 
 
 def navigate(obs: mf.Observation) -> tuple[list[float], bool]:
@@ -14,7 +30,6 @@ def navigate(obs: mf.Observation) -> tuple[list[float], bool]:
     scale = max(1.0, math.hypot(dx, dy))
     boost = not me["in_zone"] and me["grounded"] and me["energy"] > 0
     return [dx / scale, dy / scale], boost
-
 
 
 class StallRecovery:
@@ -49,6 +64,7 @@ class StallRecovery:
                 self.anchor = None
                 return self.escape.copy()
         return move
+
 
 def select_target(obs: mf.Observation) -> mf.ActorObs | None:
     """Select the closest tracked opposing mech, breaking ties by id."""
@@ -103,6 +119,6 @@ def gun_controls(
 
 
 def resources(obs: mf.Observation) -> int | None:
-    """Return an upgrade choice index when an offer has choices."""
-    offer = obs["offer"]
+    """Accept the first upgrade choice when offered."""
+    offer = obs.get("offer")
     return 0 if offer and offer["choices"] else None

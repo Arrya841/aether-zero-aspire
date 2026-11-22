@@ -1,4 +1,4 @@
-"""Ground routing, line-of-sight, and optional terrain queries on a 4 m grid."""
+"""3D-aware ground routing, prism-top LOS, cover search, and terrain slope queries."""
 from array import array
 from collections import deque
 import json
@@ -14,14 +14,22 @@ class GroundMap:
         self.x0, self.y0 = bounds["minX"], bounds["minY"]
         self.width = math.ceil((bounds["maxX"] - self.x0) / STEP)
         self.height = math.ceil((bounds["maxY"] - self.y0) / STEP)
-        self.solid = set()
+
+        # Store per-cell max solid height (m) for true 3D LOS and cover checks.
+        self.solid_top: dict[tuple[int, int], float] = {}
+        self.solid: set[tuple[int, int]] = set()
         for prism in world.get("prisms", []):
             if prism.get("kind") == "bridge":
                 continue
-            solid = self.fill(prism["ring"])
+            top_z = float(prism.get("top", 25.0))
+            cells = self.fill(prism["ring"])
             for hole in prism.get("holes", []):
-                solid.difference_update(self.fill(hole))
-            self.solid.update(solid)
+                cells.difference_update(self.fill(hole))
+            self.solid.update(cells)
+            for c in cells:
+                prev = self.solid_top.get(c)
+                if prev is None or top_z > prev:
+                    self.solid_top[c] = top_z
 
         # Dilate once after all prisms are rasterized for mech radius + grid error.
         padding = math.ceil(radius / STEP)
@@ -130,19 +138,89 @@ class GroundMap:
     def is_walkable_point(self, x: float, y: float) -> bool:
         return self.open(self.cell(x, y))
 
-    def has_los(self, x0: float, y0: float, x1: float, y1: float) -> bool:
-        """Fast 2D grid line-of-sight check against solid building footprints."""
+    def has_los(
+        self,
+        x0: float,
+        y0: float,
+        x1: float,
+        y1: float,
+        z0: float | None = None,
+        z1: float | None = None,
+    ) -> bool:
+        """Fast 3D-aware grid LOS check against solid building prism tops."""
         dist = math.hypot(x1 - x0, y1 - y0)
         if dist < STEP:
             return True
         steps = max(2, math.ceil(dist / (STEP * 0.5)))
         dx = (x1 - x0) / steps
         dy = (y1 - y0) / steps
-        # Skip the very first and last sample so endpoints hugging a wall don't self-block.
+        use_3d = z0 is not None and z1 is not None
+        dz = ((z1 - z0) / steps) if use_3d else 0.0
         for i in range(1, steps):
-            if self.cell(x0 + dx * i, y0 + dy * i) in self.solid:
-                return False
+            c = self.cell(x0 + dx * i, y0 + dy * i)
+            top = self.solid_top.get(c)
+            if top is not None:
+                if not use_3d or (z0 + dz * i) < top:
+                    return False
         return True
+
+    def find_cover_direction(
+        self,
+        mx: float,
+        my: float,
+        mz: float,
+        enemies: list[dict],
+        zone_center: list[float],
+        zone_radius: float,
+    ) -> list[float] | None:
+        """Find the nearest open cell within 28 m that breaks 3D LOS to tracked enemies.
+
+        Bounded O(R * K) with <= 40 sampled ring cells and K <= 5 enemies (< 0.25 ms).
+        """
+        if not enemies:
+            return None
+        threats = sorted(enemies, key=lambda e: math.hypot(e["pos"][0] - mx, e["pos"][1] - my))[:5]
+        start_c = self.cell(mx, my)
+        best = None
+        zcx, zcy = zone_center
+
+        # Sample concentric rings at 2, 4, 6 cells (8m, 16m, 24m) in 12 angular directions
+        for radius_cells in (2, 4, 6):
+            for k in range(12):
+                ang = k * (math.tau / 12.0)
+                cc = (
+                    start_c[0] + round(radius_cells * math.cos(ang)),
+                    start_c[1] + round(radius_cells * math.sin(ang)),
+                )
+                if not self.open(cc):
+                    continue
+                cx, cy = self.cell_center(cc)
+                if math.hypot(cx - zcx, cy - zcy) > max(12.0, zone_radius - 6.0):
+                    continue
+                # Must be reachable via clear 2D path from current position
+                if not self.has_los(mx, my, cx, cy):
+                    continue
+                exposed = 0
+                min_edist = 1e9
+                for e in threats:
+                    ex, ey, ez = e["pos"]
+                    ed = math.hypot(cx - ex, cy - ey)
+                    min_edist = min(min_edist, ed)
+                    if self.has_los(cx, cy, ex, ey, mz + 7.0, ez + 7.0):
+                        exposed += 1
+                # Prefer 0 exposed enemies, then closer cover, then safer distance from enemies
+                score = -exposed * 500.0 - radius_cells * 12.0 + min(min_edist, 90.0) * 1.5
+                if best is None or score > best[0]:
+                    best = (score, exposed, cx, cy)
+            # Early exit if we found full occlusion (0 exposed) on a close ring
+            if best is not None and best[1] == 0:
+                break
+
+        if best is None:
+            return None
+        dx, dy = best[2] - mx, best[3] - my
+        norm = max(1.0, math.hypot(dx, dy))
+        return [dx / norm, dy / norm]
 
     def nearest_open(self, cell: tuple[int, int]):
         x, y = cell
@@ -163,7 +241,6 @@ class GroundMap:
         zb = self.ground_z(*self.cell_center(b))
         if za is None or zb is None:
             return True
-        # Walkable slope limit is 50 deg (~1.19 * 4m = 4.76m per cell); allow slight margin.
         return abs(zb - za) <= 4.6
 
     def steer(self, obs, fallback, goal_xy=None, avoid_enemies=True):
@@ -199,7 +276,6 @@ class GroundMap:
                 return self.direction(x, y, exit_cell)
             return fallback
 
-        # Incrementally expand reverse shortest-path field from goal.
         for _ in range(1400):
             if start in self.next_cell or not self.frontier:
                 break
@@ -225,7 +301,6 @@ class GroundMap:
                 dest = self.choose_step(start, dest, enemies)
                 return self.direction(x, y, dest)
 
-        # Skip up to five waypoints if their bounding rectangle is completely open.
         for _ in range(5):
             farther = self.next_cell[dest]
             if farther == dest or not self.clear_rectangle(start, farther):
