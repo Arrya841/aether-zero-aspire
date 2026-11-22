@@ -79,6 +79,13 @@ def gun_controls(
     dx, dy = tx - x, ty - y
     # Observed positions are at the feet. Aim at the base mech center.
     dz = tz + config["mech"]["height"] / 2 - (z + me["stats"]["muzzle_height"])
+    # One flight-time estimate using the gun speed reported this match.
+    speed = gun["stats"]["speed"]
+    travel = min(math.hypot(dx, dy, dz) / speed, 0.45)
+    vx, vy, vz = target["vel"]
+    dx += vx * travel
+    dy += vy * travel
+    dz += vz * travel
     horizontal = math.hypot(dx, dy)
     yaw = math.atan2(dy, dx)
     pitch = math.atan2(dz, horizontal)

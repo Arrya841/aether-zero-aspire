@@ -13,13 +13,14 @@ Step 1 is a deterministic Mech Royale baseline. It walks toward the next zone ce
 | Weapons | `gun_controls(obs, target, config) -> (aim, fire, reload)` | World yaw and pitch in radians or no aim, two slot trigger booleans, and a reload boolean |
 | Resources | `resources(obs) -> int or None` | Current offer choice index or no choice |
 
-Policy functions treat input dictionaries as read-only. They are deterministic, with no filesystem or network calls per tick. The strategy owns the merge and the original observation tick. An absent target suppresses fire and keeps the previous commanded aim. Slot 1 stays idle. Keep protocol I/O in the wrapper. Future map initialization belongs before ready and should use the map path in hello.
+Policy functions treat input dictionaries as read-only. They are deterministic, with no filesystem or network calls per tick. The strategy owns the merge and the original observation tick. An absent target suppresses fire and keeps the previous commanded aim. The starting gun predicts target movement for up to 0.45 seconds using its reported projectile speed. Equipped lightning checks the current target bearing against its cone. The wrapper handles protocol I/O. Map initialization uses the path in hello before ready.
 
 ## Verify
 
 From the workspace root on Windows:
 
 ```powershell
+python -B outputs/aspire/check_aim.py work/mechfight-kit/check/stream.jsonl.gz
 python -B work/mechfight-kit/check/check.py -- python -B -u outputs/aspire/bot.py
 docker build --platform linux/amd64 -t aspire:step1 outputs/aspire
 ```
