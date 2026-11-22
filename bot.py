@@ -71,7 +71,9 @@ class Aspire:
         if target and aim and secondary and secondary["kind"] == "lightning":
             stats = secondary["stats"]
             me = obs["self"]
-            yaw_error = math.remainder(aim[0] - me["aim"][0], math.tau)
+            tx, ty, _ = target["pos"]
+            x, y, _ = me["pos"]
+            yaw_error = math.remainder(math.atan2(ty - y, tx - x) - me["aim"][0], math.tau)
             fire[1] = (
                 me["in_zone"] and me["energy"] >= stats["energy"]
                 and secondary["cooldown"] <= 0
