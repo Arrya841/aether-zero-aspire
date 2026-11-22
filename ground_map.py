@@ -19,8 +19,6 @@ class GroundMap:
         self.solid_top: dict[tuple[int, int], float] = {}
         self.solid: set[tuple[int, int]] = set()
         for prism in world.get("prisms", []):
-            if prism.get("kind") == "bridge":
-                continue
             top_z = float(prism.get("top", 25.0))
             cells = self.fill(prism["ring"])
             for hole in prism.get("holes", []):
@@ -276,7 +274,7 @@ class GroundMap:
                 return self.direction(x, y, exit_cell)
             return fallback
 
-        for _ in range(1400):
+        for _ in range(4000):
             if start in self.next_cell or not self.frontier:
                 break
             a, b = here = self.frontier.popleft()
