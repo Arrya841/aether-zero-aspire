@@ -41,3 +41,4 @@ The Step 1 Docker check on Windows used the official checker through a local lau
 ```powershell
 python -B work/check_docker_windows.py --map-dir /arena -- docker run --rm -i --network none --cpus 1 --memory 512m --memory-swap 512m --pids-limit 128 --cap-drop ALL --read-only --tmpfs /tmp:rw,size=64m --user 65534:65534 -v "${PWD}/work/mechfight-kit/arena:/arena:ro" aspire:step1
 ```
+The development version adds per-match stall recovery after navigation. When grounded movement covers less than 0.75 m over 0.8 s away from the goal, it steps sideways for 1.5 s and retries the zone route. Repeated stalls alternate sides.

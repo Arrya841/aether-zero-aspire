@@ -16,6 +16,40 @@ def navigate(obs: mf.Observation) -> tuple[list[float], bool]:
     return [dx / scale, dy / scale], boost
 
 
+
+class StallRecovery:
+    """Keep one match's progress sample and a short escape direction."""
+
+    def __init__(self):
+        self.anchor = None
+        self.sample_time = 0.0
+        self.escape_until = 0.0
+        self.escape = [0.0, 0.0]
+        self.side = 1
+
+    def steer(self, obs: mf.Observation, move: list[float]) -> list[float]:
+        me = obs["self"]
+        pos = me["pos"][:2]
+        now = obs["t"]
+        if not me["grounded"] or math.dist(pos, obs["zone"]["next_center"]) < 2:
+            self.anchor = None
+            self.escape_until = 0.0
+            return move
+        if now < self.escape_until:
+            return self.escape.copy()
+        if self.anchor is None:
+            self.anchor, self.sample_time = pos, now
+        elif now - self.sample_time >= 0.8:
+            stalled = math.dist(self.anchor, pos) < 0.75
+            self.anchor, self.sample_time = pos, now
+            if stalled:
+                self.escape = [-self.side * move[1], self.side * move[0]]
+                self.side *= -1
+                self.escape_until = now + 1.5
+                self.anchor = None
+                return self.escape.copy()
+        return move
+
 def select_target(obs: mf.Observation) -> mf.ActorObs | None:
     """Select the closest tracked opposing mech, breaking ties by id."""
     origin = obs["self"]["pos"]
