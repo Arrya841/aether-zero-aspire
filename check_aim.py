@@ -29,16 +29,25 @@ def main():
     assert math.isclose(aim(100, -12), -aim(100, 12))
     assert math.isclose(aim(250, 12), math.atan2(12 * 0.45, 250))
 
+    # Exercise adaptive gun lead through the submitted match entry point.
+    observation.update(mechs=[{"kind": "mech", "id": 13, "pos": [100, 0, 0],
+                               "vel": [0, 12, 0]}], pickups=[])
+    entrant = Aspire(hello)
+    assert entrant.act(observation)["aim"][0] > 0
+    observation["t"] += 0.1
+    observation["mechs"][0]["vel"] = [0, -12, 0]
+    assert abs(entrant.act(observation)["aim"][0]) < 1e-6
+
     stats = hello["config"]["weapons"]["lightning"]
     me["weapons"][1] = {"kind": "lightning", "stats": stats, "cooldown": 0}
-    angle = math.radians(stats["cone_deg"]) / 2 - 0.01
+    angle = math.radians(stats["cone_deg"]) * 0.45
     observation["mechs"] = [{
         "kind": "mech", "id": 13, "pos": [30 * math.cos(angle), 30 * math.sin(angle), 0],
         "vel": [0, 12, 0],
     }]
     observation["pickups"] = []
     action = Aspire(hello).act(observation)
-    assert action["aim"][0] > math.radians(stats["cone_deg"]) / 2
+    assert math.isclose(action["aim"][0], angle)
     assert action["fire"][1]
     print("PASS stationary aim, lateral lead, reversal, prediction cap, lightning cone")
 

@@ -1,5 +1,7 @@
 # AETHER//ZERO / ASPIRE
 
+The competition entry uses adaptive projectile aim, combat strafing, terrain-aware movement and equipment selection. The starter interfaces remain available in `policy.py`.
+
 Step 1 is a deterministic Mech Royale baseline. It walks toward the next zone center, boosts on the ground outside the current circle, aims at the nearest tracked opposing mech, fires the starting gun when aim and range allow, and accepts the first upgrade choice.
 
 ## Frozen Step 1 contracts
